@@ -37,7 +37,7 @@ if (!app.requestSingleInstanceLock()) {
   async function ensureServer() {
     if (await serverIsUp()) return;
     const { startServer } = await import(pathToFileURL(path.join(__dirname, '../server/index.mjs')).href);
-    floor = await startServer({ port: PORT, log: () => {} });
+    floor = await startServer({ port: PORT, log: () => {}, useHome: true });
   }
 
   function createWindow() {

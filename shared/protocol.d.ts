@@ -9,7 +9,10 @@ export interface InboundEvent {
   role?: string;
   source?: string;
   team?: string | { id?: string; name: string };
-  parent?: string;
+  /** `null` clears the parent (a roster desk going back to idle). */
+  parent?: string | null;
+  /** Standing roster desk: never swept, its room stays on the floor. */
+  pinned?: boolean;
   status?: Status;
   activity?: string;
   tool?: string;
@@ -27,7 +30,8 @@ export interface FloorEvent {
   name?: string;
   role?: string;
   source?: string;
-  parent?: string;
+  parent?: string | null;
+  pinned?: boolean;
   team?: string;
   teamName?: string;
   status?: Status;
@@ -61,6 +65,10 @@ export interface Agent {
   lastSeen: number;
   history: HistoryEntry[];
   boundKey?: string;
+  pinned?: boolean;
+  idleActivity?: string;
+  /** Overlapping spawns of a pinned roster desk. */
+  spawns?: number;
 }
 
 export interface Team {
@@ -92,4 +100,5 @@ export function createState(): WorldState;
 export function slug(value: unknown): string;
 export function normalizeEvent(raw: unknown, now?: number): FloorEvent | null;
 export function applyEvent(state: WorldState, ev: FloorEvent | null): { state: WorldState; effects: Effect[] };
+export function settlePinned(state: WorldState, now?: number, opts?: { doneMs?: number; stuckMs?: number }): InboundEvent[];
 export function sweep(state: WorldState, now?: number, opts?: { offlineMs?: number; doneHelperMs?: number; staleMs?: number }): string[];

@@ -1,4 +1,16 @@
 import { basename } from 'node:path';
+import { EMPTY, loadRooms, roomForPath } from '../shared/rooms.js';
+
+let roomsCache;
+/** The rooms file, read once per hook process. A broken file counts as no rooms here. */
+export function rooms() {
+  return (roomsCache ??= loadRooms() || EMPTY);
+}
+
+/** Room for a working directory from the rooms file, or null. */
+export function roomFor(cwd) {
+  return roomForPath(rooms(), cwd);
+}
 
 export function shortId(value, n = 8) {
   return String(value || 'local').replace(/[^a-zA-Z0-9]/g, '').slice(0, n) || 'local';
@@ -9,7 +21,7 @@ export function slugKey(value) {
 }
 
 export function teamFromCwd(cwd) {
-  return process.env.AGENT_FLOOR_TEAM || (cwd ? basename(cwd) : 'workspace');
+  return process.env.AGENT_FLOOR_TEAM || roomFor(cwd)?.name || (cwd ? basename(cwd) : 'workspace');
 }
 
 export function pretty(value) {

@@ -104,6 +104,30 @@ The full event format is in [docs/protocol.md](docs/protocol.md). More integrati
 
 Group several repos into one room by giving them the same `AGENT_FLOOR_TEAM`.
 
+### Rooms file (optional)
+
+`~/.agent-floor/rooms.json` (or `AGENT_FLOOR_ROOMS`) gives you fixed rooms and a standing roster per room:
+
+```json
+{
+  "rooms": [
+    { "slug": "conquer", "name": "Conquer", "leadName": "Conquer Lead", "task": "Keep the game server healthy",
+      "paths": ["C:\\DarkConquer-6192"],
+      "roster": [{ "type": "live-ops-auditor", "name": "Live Ops", "job": "Health checks", "model": "haiku" }] }
+  ],
+  "mail": { "inbox": "D:\\offices\\ceo\\inbox", "decisions": "D:\\offices\\ceo\\decisions" }
+}
+```
+
+- Sessions whose folder is under one of `paths` (longest match, any case) land in that room, and the lead uses `leadName`.
+- Each `roster` entry is a desk that is always there, idle with "job · model". When the lead calls a subagent of that `type`, that desk lights up instead of a new character walking in, and goes back to idle when it's done.
+- A file written to `mail.inbox/<slug>/…` flies to the CEO room's `report-intake` desk; one written to `mail.decisions/<slug>/…` flies back to that room's `reporter` desk.
+- After editing the file, run `curl -X POST localhost:4317/reload -H 'content-type: application/json' -d '{}'`.
+- With a rooms file, roster desks (not lead sessions or prompts) are saved to `~/.agent-floor/state-<port>.json` and come back idle on the next start. Set `AGENT_FLOOR_PERSIST=0` to turn that off.
+- A broken rooms file (half-saved, bad JSON) keeps the current rooms until it is fixed. A desk left busy by an interrupted subagent resets after 30 minutes.
+
+Without the file, Agent Floor behaves exactly as before.
+
 ## Privacy and safety
 
 - The server binds to `127.0.0.1` and only answers loopback host names.

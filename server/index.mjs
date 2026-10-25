@@ -4,12 +4,15 @@
 //   GET  /stream        Server-Sent Events: a `snapshot`, then `event` + `effects`
 //   GET  /state         current world as JSON
 //   POST /reset         clear the floor
+//   POST /reload        re-read the rooms file and re-seed roster desks
 //   GET  /*             the built web app (dist/)
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { extname, join, normalize, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { applyEvent, createState, normalizeEvent, sweep, PROTOCOL_VERSION } from '../shared/protocol.js';
+import { applyEvent, createState, normalizeEvent, settlePinned, sweep, PROTOCOL_VERSION } from '../shared/protocol.js';
+import { floorHome, loadRooms, roomsFile as defaultRoomsFile, seedEvents } from '../shared/rooms.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAX_BODY = 256 * 1024;
@@ -30,16 +33,75 @@ export function startServer({
   host = process.env.AGENT_FLOOR_HOST || '127.0.0.1',
   staticDir = resolve(here, '../dist'),
   log = console.log,
+  // The CLI and desktop app pass useHome: true, so tests never touch ~/.agent-floor.
+  useHome = false,
+  roomsFile = useHome ? defaultRoomsFile() : undefined,
+  // Saving only happens with a rooms file (no file = behaves as before), one file per port.
+  stateFile = useHome && process.env.AGENT_FLOOR_PERSIST !== '0' && roomsFile && existsSync(roomsFile)
+    ? join(floorHome(), `state-${port}.json`)
+    : undefined,
 } = {}) {
   const state = createState();
   const clients = new Set();
+
+  // Restore the roster desks (and their rooms) from the last run. Only pinned desks are
+  // saved: lead sessions carry prompts and would come back as stale ghosts.
+  const isObj = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
+  if (stateFile) {
+    try {
+      const saved = JSON.parse(readFileSync(stateFile, 'utf8'));
+      if (isObj(saved) && isObj(saved.agents) && isObj(saved.teams)) {
+        for (const a of Object.values(saved.agents)) {
+          if (!isObj(a) || typeof a.id !== 'string' || typeof a.team !== 'string' || !a.pinned) continue;
+          state.agents[a.id] = {
+            ...a,
+            history: Array.isArray(a.history) ? a.history.filter(isObj) : [],
+            status: 'idle',
+            activity: a.idleActivity || a.activity,
+            tool: undefined,
+            parent: undefined,
+            boundKey: undefined,
+            spawns: 0,
+          };
+        }
+        const used = new Set(Object.values(state.agents).map((a) => a.team));
+        for (const [id, t] of Object.entries(saved.teams)) if (used.has(id) && isObj(t)) state.teams[id] = t;
+        for (const a of Object.values(state.agents)) if (!state.teams[a.team]) delete state.agents[a.id];
+        state.seq = Number(saved.seq) || 0;
+        state.updatedAt = Number(saved.updatedAt) || 0;
+      }
+    } catch {
+      // No saved state yet, or it is unreadable: start empty (seeding fills the rooms).
+    }
+  }
+  let savedSeq = -1;
+  function save() {
+    if (!stateFile || state.seq === savedSeq) return;
+    try {
+      const agents = Object.fromEntries(Object.values(state.agents).filter((a) => a.pinned).map((a) => [a.id, a]));
+      const used = new Set(Object.values(agents).map((a) => a.team));
+      const teams = Object.fromEntries(Object.entries(state.teams).filter(([id]) => used.has(id)));
+      mkdirSync(dirname(stateFile), { recursive: true });
+      const tmp = `${stateFile}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ teams, agents, seq: state.seq, updatedAt: state.updatedAt }));
+      renameSync(tmp, stateFile);
+      savedSeq = state.seq;
+    } catch (err) {
+      log(`Agent Floor could not save state: ${err.message}`);
+    }
+  }
 
   function broadcast(name, data) {
     const frame = `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of clients) res.write(frame);
   }
 
-  function ingest(raw) {
+  // `external` events come from POST /events: they may not pin agents (only the rooms file can).
+  function ingest(raw, { external = false } = {}) {
+    if (external && raw && typeof raw === 'object' && 'pinned' in raw) {
+      raw = { ...raw };
+      delete raw.pinned;
+    }
     const ev = normalizeEvent(raw);
     if (!ev) return false;
     const { effects } = applyEvent(state, ev);
@@ -47,10 +109,35 @@ export function startServer({
     return true;
   }
 
+  // Standing roster desks from the rooms file. Agents that were pinned before
+  // but are no longer listed leave the floor normally.
+  function seed() {
+    if (!roomsFile) return 0;
+    const cfg = loadRooms(roomsFile);
+    if (!cfg) {
+      // Half-saved or broken file: keep the desks we have until it is fixed.
+      log('Agent Floor: rooms file is unreadable, keeping the current rooms.');
+      return Object.values(state.agents).filter((a) => a.pinned).length;
+    }
+    const events = seedEvents(cfg);
+    const keep = new Set(events.filter((e) => e.type === 'join').map((e) => e.agent));
+    for (const a of Object.values(state.agents)) {
+      if (a.pinned && !keep.has(a.id)) {
+        ingest({ type: 'status', agent: a.id, pinned: false });
+        ingest({ type: 'leave', agent: a.id });
+      }
+    }
+    for (const ev of events) ingest(ev);
+    return keep.size;
+  }
+  seed();
+
   const sweeper = setInterval(() => {
+    for (const ev of settlePinned(state)) ingest(ev);
     const removed = sweep(state);
     if (removed.length) broadcast('removed', { agents: removed });
   }, 2000);
+  const saver = stateFile ? setInterval(save, 10_000) : null;
   const heartbeat = setInterval(() => {
     for (const res of clients) res.write(': ping\n\n');
   }, 20000);
@@ -126,7 +213,7 @@ export function startServer({
         const body = await readBody(req);
         const list = Array.isArray(body) ? body : [body];
         let accepted = 0;
-        for (const raw of list.slice(0, 200)) if (ingest(raw)) accepted++;
+        for (const raw of list.slice(0, 200)) if (ingest(raw, { external: true })) accepted++;
         return json(res, accepted ? 202 : 400, { accepted, rejected: list.length - accepted });
       }
       if (pathname === '/stream' && req.method === 'GET') {
@@ -145,7 +232,11 @@ export function startServer({
       if (pathname === '/health') return json(res, 200, { ok: true, version: PROTOCOL_VERSION, agents: Object.keys(state.agents).length });
       if (pathname === '/reset' && req.method === 'POST') {
         ingest({ type: 'reset' });
+        seed();
         return json(res, 200, { ok: true });
+      }
+      if (pathname === '/reload' && req.method === 'POST') {
+        return json(res, 200, { ok: true, roster: seed() });
       }
       if (req.method === 'GET') return serveStatic(req, res);
       return json(res, 404, { error: 'Not found' });
@@ -162,9 +253,12 @@ export function startServer({
         server,
         state,
         ingest,
+        save,
         close() {
           clearInterval(sweeper);
           clearInterval(heartbeat);
+          if (saver) clearInterval(saver);
+          save();
           for (const res of clients) res.end();
           return new Promise((r) => server.close(r));
         },

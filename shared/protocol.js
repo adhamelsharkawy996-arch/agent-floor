@@ -59,7 +59,9 @@ export function normalizeEvent(raw, now = Date.now()) {
     name: clip(raw.name ?? agentRaw.name, 40),
     role: clip(raw.role ?? agentRaw.role, 40),
     source: clip(raw.source ?? agentRaw.source, 32),
-    parent: raw.parent != null ? String(raw.parent).slice(0, 128) : undefined,
+    // `parent: null` clears an agent's parent (a standing roster desk going back to idle).
+    parent: raw.parent === null ? null : raw.parent != null ? String(raw.parent).slice(0, 128) : undefined,
+    pinned: typeof raw.pinned === 'boolean' ? raw.pinned : undefined,
     team: teamName ? slug(teamRaw.id ?? teamName) : undefined,
     teamName,
     status: STATUSES.includes(raw.status) ? raw.status : undefined,
@@ -118,7 +120,7 @@ function ensureAgent(state, ev, now) {
       role: ev.role || 'Agent',
       team: teamId,
       source: ev.source || 'custom',
-      parent: ev.parent,
+      parent: ev.parent || undefined,
       status: 'idle',
       activity: undefined,
       tool: undefined,
@@ -132,8 +134,24 @@ function ensureAgent(state, ev, now) {
     if (ev.role) agent.role = ev.role;
     if (ev.source) agent.source = ev.source;
     if (ev.parent) agent.parent = ev.parent;
+    // `parent: null` only means something for a pinned desk, and only once its last spawn ends.
+    else if (ev.parent === null && agent.pinned && !((agent.spawns || 0) > 1)) {
+      agent.parent = undefined;
+      agent.boundKey = undefined;
+    }
     if (ev.team && ev.team !== agent.team) agent.team = ev.team;
     agent.lastSeen = now;
+  }
+  if (ev.pinned !== undefined) {
+    agent.pinned = ev.pinned || undefined;
+    if (!ev.pinned) agent.spawns = undefined;
+  }
+  if (agent.pinned && ev.pinned && ev.type === 'join' && ev.activity) agent.idleActivity = ev.activity;
+  // An internal settle (status + pinned) forces a stuck desk back to a clean idle.
+  if (agent.pinned && ev.pinned === true && ev.type === 'status') {
+    agent.spawns = 0;
+    agent.parent = undefined;
+    agent.boundKey = undefined;
   }
   return agent;
 }
@@ -150,9 +168,10 @@ function resolveSubagent(state, ev) {
   const children = Object.values(state.agents).filter((a) => a.parent === parentId);
   let match = key && children.find((a) => a.boundKey === key);
   if (!match && type) {
+    // A standing roster desk of this type wins over a temporary one.
     match = children
       .filter((a) => !a.boundKey && a.role === type && a.status !== 'done' && a.status !== 'offline')
-      .sort((a, b) => a.joinedAt - b.joinedAt)[0];
+      .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || a.joinedAt - b.joinedAt)[0];
     if (match && key) match.boundKey = key;
   }
   const id = match ? match.id : `${parentId}:${key || slug(type || 'sub')}`;
@@ -195,6 +214,20 @@ export function applyEvent(state, rawEv) {
 
   switch (ev.type) {
     case 'join': {
+      if (agent.pinned && ev.parent) {
+        // A roster desk being briefed. Count overlapping spawns of the same type,
+        // so the first one to finish does not send the desk back to idle.
+        agent.spawns = (agent.spawns || 0) + 1;
+        if (agent.spawns === 1) agent.boundKey = undefined;
+      } else if (
+        existed &&
+        agent.pinned &&
+        ev.pinned &&
+        ((agent.spawns || 0) > 0 || agent.status === 'working' || agent.status === 'thinking' || agent.status === 'waiting')
+      ) {
+        // Re-seed (reload/reset) while the desk is working: keep the work going.
+        break;
+      }
       agent.status = ev.status || 'idle';
       if (ev.activity) agent.activity = ev.activity;
       if (ev.parent) {
@@ -205,6 +238,10 @@ export function applyEvent(state, rawEv) {
       break;
     }
     case 'status': {
+      if (agent.pinned && ev.parent === null && ev.pinned !== true) {
+        agent.spawns = Math.max(0, (agent.spawns || 0) - 1);
+        if (agent.spawns > 0) break; // another spawn of this type is still running
+      }
       if (ev.status) agent.status = ev.status;
       if (ev.activity !== undefined) agent.activity = ev.activity;
       if (ev.status && ev.status !== 'working') agent.tool = undefined;
@@ -251,8 +288,24 @@ export function applyEvent(state, rawEv) {
 }
 
 /**
+ * Standing (pinned) roster desks that finished more than `doneMs` ago: the
+ * events that return them to idle. Callers apply these like any other event.
+ */
+export function settlePinned(state, now = Date.now(), { doneMs = 45_000, stuckMs = 30 * 60_000 } = {}) {
+  return Object.values(state.agents)
+    .filter((a) => {
+      if (!a.pinned || a.status === 'idle') return false;
+      const age = now - a.lastSeen;
+      // Finished desks settle quickly; a desk silent for 30 min (interrupted subagent) is reset too.
+      return ((a.status === 'done' || a.status === 'error') && age > doneMs) || age > stuckMs;
+    })
+    .map((a) => ({ type: 'status', agent: a.id, status: 'idle', activity: a.idleActivity || 'Ready', parent: null, pinned: true }));
+}
+
+/**
  * Drop offline agents after a short grace period, finished helpers (agents with a
  * parent) after they have had time to celebrate, and anything silent for hours.
+ * Pinned roster desks are never removed, so their rooms stay too.
  */
 export function sweep(
   state,
@@ -261,6 +314,7 @@ export function sweep(
 ) {
   const removed = [];
   for (const a of Object.values(state.agents)) {
+    if (a.pinned) continue;
     const age = now - a.lastSeen;
     if (
       (a.status === 'offline' && age > offlineMs) ||
