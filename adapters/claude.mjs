@@ -1,9 +1,11 @@
 // Claude Code hooks -> Agent Floor events.
 // Receives the JSON object Claude Code writes to a hook's stdin.
 // https://docs.claude.com/en/docs/claude-code/hooks
-import { describeTool, pretty, shortId, shortToolName, slugKey, teamFromCwd } from './common.mjs';
+import { describeTool, pretty, roomFor, rooms, shortId, shortToolName, slugKey, teamFromCwd } from './common.mjs';
+import { idleLine, mailTarget, rosterEntry, rosterId } from '../shared/rooms.js';
 
 const SPAWN_TOOLS = new Set(['Task', 'Agent']);
+const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit']);
 
 /**
  * @param {Record<string, any>} input hook payload
@@ -15,11 +17,13 @@ export function fromClaude(input, opts = {}) {
   const source = opts.source || 'claude-code';
   const lead = `${source}:${shortId(input.session_id)}`;
   const team = teamFromCwd(input.cwd);
+  // Rooms file: an env team override wins, so only use the room when it is the one in use.
+  const room = process.env.AGENT_FLOOR_TEAM ? null : roomFor(input.cwd);
   const base = {
     agent: lead,
     team,
     source,
-    name: process.env.AGENT_FLOOR_NAME || opts.name || (source === 'codex' ? 'Codex' : 'Claude'),
+    name: process.env.AGENT_FLOOR_NAME || room?.leadName || opts.name || (source === 'codex' ? 'Codex' : 'Claude'),
     role: 'Lead',
   };
   // Inside a subagent, newer Claude Code versions add agent_id / agent_type.
@@ -40,15 +44,17 @@ export function fromClaude(input, opts = {}) {
       if (SPAWN_TOOLS.has(tool)) {
         const type = toolInput.subagent_type || 'general-purpose';
         const key = input.tool_use_id || slugKey(toolInput.description || type);
+        const entry = rosterEntry(room, type);
         return [
           { type: 'tool', ...actor, tool, activity: describeTool(tool, toolInput) },
           {
             type: 'join',
-            agent: `${lead}:${shortId(key, 12)}`,
+            // A roster type lights up its own standing desk instead of a new character.
+            agent: entry ? rosterId(room.slug, type) : `${lead}:${shortId(key, 12)}`,
             parent: lead,
             team,
-            source,
-            name: pretty(type),
+            source: entry ? 'roster' : source,
+            name: entry?.name || pretty(type),
             role: type,
             status: 'thinking',
             activity: toolInput.description || 'Starting',
@@ -57,6 +63,10 @@ export function fromClaude(input, opts = {}) {
         ];
       }
       const events = [{ type: 'tool', ...actor, tool: shortToolName(tool), activity: describeTool(tool, toolInput) }];
+      if (WRITE_TOOLS.has(tool)) {
+        const mail = mailTarget(rooms(), toolInput.file_path);
+        if (mail) events.push({ type: 'message', ...actor, to: mail.to, text: mail.text });
+      }
       if (tool === 'TodoWrite' && Array.isArray(toolInput.todos)) {
         const current =
           toolInput.todos.find((t) => t.status === 'in_progress') || toolInput.todos.find((t) => t.status === 'pending');
@@ -67,6 +77,16 @@ export function fromClaude(input, opts = {}) {
 
     case 'PostToolUse': {
       if (SPAWN_TOOLS.has(tool)) {
+        const type = toolInput.subagent_type || 'general-purpose';
+        const entry = rosterEntry(room, type);
+        if (entry) {
+          const desk = rosterId(room.slug, type);
+          return [
+            { type: 'message', agent: desk, team, to: lead, text: 'Report ready' },
+            { type: 'status', agent: desk, status: 'idle', activity: idleLine(entry), parent: null },
+            { type: 'status', ...base, status: 'thinking', activity: `Reviewing ${entry.name || pretty(type)} report` },
+          ];
+        }
         const key = input.tool_use_id || slugKey(toolInput.description || toolInput.subagent_type || 'general-purpose');
         const child = `${lead}:${shortId(key, 12)}`;
         return [

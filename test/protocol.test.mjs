@@ -5,6 +5,9 @@ import { fromClaude } from '../adapters/claude.mjs';
 import { fromCodex } from '../adapters/codex.mjs';
 import { fromCursor, cursorResponse } from '../adapters/cursor.mjs';
 
+// Ignore any real ~/.agent-floor/rooms.json on the machine running the tests (read lazily).
+process.env.AGENT_FLOOR_ROOMS = '\0no-rooms-file';
+
 const run = (state, raw) => applyEvent(state, normalizeEvent(raw));
 
 test('any event creates its agent and team', () => {

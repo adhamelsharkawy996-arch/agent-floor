@@ -1,6 +1,6 @@
 {
   "name": "agent-floor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A live 3D office for your coding agents. See every agent at its desk, what it is doing, and who it is talking to. Works with Claude Code, Codex, Cursor, or anything that can send an HTTP request.",
   "type": "module",
   "license": "MIT",

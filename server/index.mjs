@@ -4,12 +4,15 @@
 //   GET  /stream        Server-Sent Events: a `snapshot`, then `event` + `effects`
 //   GET  /state         current world as JSON
 //   POST /reset         clear the floor
+//   POST /reload        re-read the rooms file and re-seed roster desks
 //   GET  /*             the built web app (dist/)
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { extname, join, normalize, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { applyEvent, createState, normalizeEvent, sweep, PROTOCOL_VERSION } from '../shared/protocol.js';
+import { applyEvent, createState, normalizeEvent, settlePinned, sweep, PROTOCOL_VERSION } from '../shared/protocol.js';
+import { floorHome, loadRooms, roomsFile as defaultRoomsFile, seedEvents } from '../shared/rooms.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAX_BODY = 256 * 1024;
@@ -30,9 +33,41 @@ export function startServer({
   host = process.env.AGENT_FLOOR_HOST || '127.0.0.1',
   staticDir = resolve(here, '../dist'),
   log = console.log,
+  // The CLI and desktop app pass useHome: true, so tests never touch ~/.agent-floor.
+  useHome = false,
+  roomsFile = useHome ? defaultRoomsFile() : undefined,
+  stateFile = useHome && process.env.AGENT_FLOOR_PERSIST !== '0' ? join(floorHome(), 'state.json') : undefined,
 } = {}) {
   const state = createState();
   const clients = new Set();
+
+  // Restore the last saved floor, so a restart or crash does not empty the rooms.
+  if (stateFile) {
+    try {
+      const saved = JSON.parse(readFileSync(stateFile, 'utf8'));
+      if (saved && typeof saved.agents === 'object' && typeof saved.teams === 'object') {
+        state.teams = saved.teams;
+        state.agents = saved.agents;
+        state.seq = Number(saved.seq) || 0;
+        state.updatedAt = Number(saved.updatedAt) || 0;
+      }
+    } catch {
+      // No saved state yet, or it is unreadable: start empty.
+    }
+  }
+  let savedSeq = state.seq;
+  function save() {
+    if (!stateFile || state.seq === savedSeq) return;
+    try {
+      mkdirSync(dirname(stateFile), { recursive: true });
+      const tmp = `${stateFile}.tmp`;
+      writeFileSync(tmp, JSON.stringify(state));
+      renameSync(tmp, stateFile);
+      savedSeq = state.seq;
+    } catch (err) {
+      log(`Agent Floor could not save state: ${err.message}`);
+    }
+  }
 
   function broadcast(name, data) {
     const frame = `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -47,10 +82,29 @@ export function startServer({
     return true;
   }
 
+  // Standing roster desks from the rooms file. Agents that were pinned before
+  // but are no longer listed leave the floor normally.
+  function seed() {
+    if (!roomsFile) return 0;
+    const events = seedEvents(loadRooms(roomsFile));
+    const keep = new Set(events.filter((e) => e.type === 'join').map((e) => e.agent));
+    for (const a of Object.values(state.agents)) {
+      if (a.pinned && !keep.has(a.id)) {
+        ingest({ type: 'status', agent: a.id, pinned: false });
+        ingest({ type: 'leave', agent: a.id });
+      }
+    }
+    for (const ev of events) ingest(ev);
+    return keep.size;
+  }
+  seed();
+
   const sweeper = setInterval(() => {
+    for (const ev of settlePinned(state)) ingest(ev);
     const removed = sweep(state);
     if (removed.length) broadcast('removed', { agents: removed });
   }, 2000);
+  const saver = stateFile ? setInterval(save, 10_000) : null;
   const heartbeat = setInterval(() => {
     for (const res of clients) res.write(': ping\n\n');
   }, 20000);
@@ -145,7 +199,11 @@ export function startServer({
       if (pathname === '/health') return json(res, 200, { ok: true, version: PROTOCOL_VERSION, agents: Object.keys(state.agents).length });
       if (pathname === '/reset' && req.method === 'POST') {
         ingest({ type: 'reset' });
+        seed();
         return json(res, 200, { ok: true });
+      }
+      if (pathname === '/reload' && req.method === 'POST') {
+        return json(res, 200, { ok: true, roster: seed() });
       }
       if (req.method === 'GET') return serveStatic(req, res);
       return json(res, 404, { error: 'Not found' });
@@ -162,9 +220,12 @@ export function startServer({
         server,
         state,
         ingest,
+        save,
         close() {
           clearInterval(sweeper);
           clearInterval(heartbeat);
+          if (saver) clearInterval(saver);
+          save();
           for (const res of clients) res.end();
           return new Promise((r) => server.close(r));
         },

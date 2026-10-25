@@ -326,7 +326,9 @@ async function start(args) {
   const port = Number(f.port) || undefined;
   const host = f.host || undefined;
   try {
-    await startServer({ port, host });
+    const floor = await startServer({ port, host, useHome: true });
+    // Save the floor on Ctrl+C or a service stop, so the next start restores it.
+    for (const sig of ['SIGINT', 'SIGTERM']) process.once(sig, () => floor.close().finally(() => process.exit(0)));
     if (f.open) await openApp({ browser: Boolean(f.browser) });
     console.log('Connect an agent:  agent-floor setup claude | codex | cursor');
     console.log('Press Ctrl+C to stop.');
