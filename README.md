@@ -123,7 +123,8 @@ Group several repos into one room by giving them the same `AGENT_FLOOR_TEAM`.
 - Each `roster` entry is a desk that is always there, idle with "job · model". When the lead calls a subagent of that `type`, that desk lights up instead of a new character walking in, and goes back to idle when it's done.
 - A file written to `mail.inbox/<slug>/…` flies to the CEO room's `report-intake` desk; one written to `mail.decisions/<slug>/…` flies back to that room's `reporter` desk.
 - After editing the file, run `curl -X POST localhost:4317/reload -H 'content-type: application/json' -d '{}'`.
-- The floor is saved to `~/.agent-floor/state.json` and restored on start. Set `AGENT_FLOOR_PERSIST=0` to turn that off.
+- With a rooms file, roster desks (not lead sessions or prompts) are saved to `~/.agent-floor/state-<port>.json` and come back idle on the next start. Set `AGENT_FLOOR_PERSIST=0` to turn that off.
+- A broken rooms file (half-saved, bad JSON) keeps the current rooms until it is fixed. A desk left busy by an interrupted subagent resets after 30 minutes.
 
 Without the file, Agent Floor behaves exactly as before.
 

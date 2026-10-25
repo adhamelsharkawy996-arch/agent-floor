@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -48,12 +48,12 @@ const { startServer } = await import('../server/index.mjs');
 const run = (state, raw) => applyEvent(state, normalizeEvent(raw));
 const cfg = loadRooms(roomsPath);
 
-test('rooms file: junk entries dropped, bad file means no rooms', () => {
+test('rooms file: junk entries dropped, missing file = no rooms, broken file = null', () => {
   assert.equal(cfg.rooms.length, 3);
   assert.deepEqual(loadRooms(join(dir, 'missing.json')).rooms, []);
   const broken = join(dir, 'broken.json');
   writeFileSync(broken, '{nope');
-  assert.deepEqual(loadRooms(broken).rooms, []);
+  assert.equal(loadRooms(broken), null);
 });
 
 test('roomForPath: Windows paths, any case, longest prefix wins', () => {
@@ -139,36 +139,114 @@ test('a finished roster desk settles back to idle', () => {
   assert.equal(s.agents['roster:ceo:jev-judge'].activity, 'Adopt / revise / drop · sonnet');
 });
 
-test('server seeds, reloads, and restores state after a restart', async () => {
+const post = (base, path, body) =>
+  fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+test('server seeds, reloads, and restores roster desks after a restart', async () => {
   const stateFile = join(dir, 'state.json');
   let floor = await startServer({ port: 0, log: () => {}, roomsFile: roomsPath, stateFile });
   let base = `http://127.0.0.1:${floor.server.address().port}`;
   try {
     let state = await (await fetch(`${base}/state`)).json();
     assert.ok(state.agents['roster:conquer:reporter']?.pinned);
-    await fetch(`${base}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'join', agent: 'guest', team: 'Guest' }) });
+    await post(base, '/events', [
+      { type: 'join', agent: 'guest', team: 'Guest', activity: 'Asked: a private prompt' },
+      { type: 'tool', agent: 'roster:conquer:reporter', tool: 'Write', activity: 'Writing r.md' },
+    ]);
 
+    // A broken rooms file keeps the current desks.
+    writeFileSync(roomsPath, '{"rooms": [');
+    assert.equal((await (await post(base, '/reload', {})).json()).roster, 4);
     // Drop a room from the file and reload: its roster leaves, the rest stays.
     writeFileSync(roomsPath, JSON.stringify({ ...ROOMS, rooms: ROOMS.rooms.filter((r) => r.slug !== 'ceo') }));
-    const reload = await (await fetch(`${base}/reload`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
-    assert.equal(reload.roster, 2);
+    assert.equal((await (await post(base, '/reload', {})).json()).roster, 2);
     state = await (await fetch(`${base}/state`)).json();
     assert.equal(state.agents['roster:ceo:report-intake'].status, 'offline');
     assert.ok(!state.agents['roster:ceo:report-intake'].pinned);
+    assert.equal(state.agents['roster:conquer:reporter'].status, 'working', 're-seed keeps a working desk working');
   } finally {
     await floor.close();
     writeFileSync(roomsPath, JSON.stringify(ROOMS));
   }
 
+  const saved = JSON.parse(readFileSync(stateFile, 'utf8'));
+  assert.equal(saved.agents.guest, undefined, 'lead sessions and prompts are not written to disk');
+
   floor = await startServer({ port: 0, log: () => {}, roomsFile: roomsPath, stateFile });
   base = `http://127.0.0.1:${floor.server.address().port}`;
   try {
     const state = await (await fetch(`${base}/state`)).json();
-    assert.ok(state.agents.guest, 'non-roster agent restored from disk');
+    assert.equal(state.agents.guest, undefined);
+    const desk = state.agents['roster:conquer:reporter'];
+    assert.equal(desk.status, 'idle', 'restored desks come back idle');
+    assert.ok(desk.history.some((h) => h.text === 'Writing r.md'), 'desk history restored');
     assert.ok(state.agents['roster:ceo:report-intake'].pinned, 're-seeded from the rooms file');
   } finally {
     await floor.close();
   }
+});
+
+test('a corrupt state file never stops the server', async () => {
+  for (const [i, text] of ['{"agents":null,"teams":{}}', '{"agents":{"x":null,"y":{"id":"y","team":"t","pinned":true}},"teams":null}', 'nope'].entries()) {
+    const stateFile = join(dir, `bad-${i}.json`);
+    writeFileSync(stateFile, text);
+    const floor = await startServer({ port: 0, log: () => {}, roomsFile: roomsPath, stateFile });
+    try {
+      for (const ev of settlePinned(floor.state, Date.now() + 3_600_000)) floor.ingest(ev);
+      sweep(floor.state, Date.now() + 3_600_000);
+      assert.ok(floor.state.agents['roster:ceo:report-intake']);
+    } finally {
+      await floor.close();
+    }
+  }
+});
+
+test('POST /events cannot pin agents', async () => {
+  const floor = await startServer({ port: 0, log: () => {} });
+  const base = `http://127.0.0.1:${floor.server.address().port}`;
+  try {
+    await post(base, '/events', { type: 'join', agent: 'sneaky', team: 'x', pinned: true });
+    assert.equal(floor.state.agents.sneaky.pinned, undefined);
+  } finally {
+    await floor.close();
+  }
+});
+
+test('parent:null is ignored for ordinary agents', () => {
+  const s = createState();
+  run(s, { type: 'join', agent: 'lead', team: 't' });
+  run(s, { type: 'join', agent: 'kid', parent: 'lead' });
+  run(s, { type: 'status', agent: 'kid', status: 'idle', parent: null });
+  assert.equal(s.agents.kid.parent, 'lead');
+});
+
+test('two overlapping spawns of one roster type: desk idles only after both finish', () => {
+  const s = createState();
+  for (const ev of seedEvents(cfg)) run(s, ev);
+  const base = { session_id: 'sess9', cwd: 'C:\\DarkConquer-6192' };
+  const spawn = (id) => ({ ...base, hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_use_id: id, tool_input: { subagent_type: 'live-ops-auditor' } });
+  for (const ev of fromClaude(spawn('a'))) run(s, ev);
+  for (const ev of fromClaude(spawn('b'))) run(s, ev);
+  const desk = s.agents['roster:conquer:live-ops-auditor'];
+  for (const ev of fromClaude({ ...spawn('a'), hook_event_name: 'PostToolUse' })) run(s, ev);
+  assert.notEqual(desk.status, 'idle', 'still busy with the second spawn');
+  assert.ok(desk.parent);
+  for (const ev of fromClaude({ ...spawn('b'), hook_event_name: 'PostToolUse' })) run(s, ev);
+  assert.equal(desk.status, 'idle');
+  assert.equal(desk.parent, undefined);
+  assert.equal(desk.spawns, 0);
+});
+
+test('a desk stuck after an interrupted subagent is reset after 30 minutes', () => {
+  const s = createState();
+  for (const ev of seedEvents(cfg)) run(s, { ...ev, ts: 1000 });
+  run(s, { type: 'join', agent: 'roster:ceo:jev-judge', parent: 'lead', status: 'thinking', ts: 2000 });
+  assert.deepEqual(settlePinned(s, 2000 + 20 * 60_000), []);
+  for (const ev of settlePinned(s, 2000 + 31 * 60_000)) run(s, ev);
+  const desk = s.agents['roster:ceo:jev-judge'];
+  assert.equal(desk.status, 'idle');
+  assert.equal(desk.spawns, 0);
+  assert.equal(desk.parent, undefined);
 });
 
 test('without a rooms file the server and adapter behave as before', async () => {

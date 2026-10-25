@@ -1,10 +1,10 @@
 import { basename } from 'node:path';
-import { loadRooms, roomForPath } from '../shared/rooms.js';
+import { EMPTY, loadRooms, roomForPath } from '../shared/rooms.js';
 
 let roomsCache;
-/** The rooms file, read once per hook process. */
+/** The rooms file, read once per hook process. A broken file counts as no rooms here. */
 export function rooms() {
-  return (roomsCache ??= loadRooms());
+  return (roomsCache ??= loadRooms() || EMPTY);
 }
 
 /** Room for a working directory from the rooms file, or null. */

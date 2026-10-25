@@ -9,13 +9,14 @@
 //   "mail": { "inbox": "D:\\...\\ceo\\inbox", "inboxTo": "ceo:report-intake",
 //             "decisions": "D:\\...\\ceo\\decisions", "decisionsTo": "{slug}:reporter" }
 // }
-// A missing or broken file means "no rooms": Agent Floor behaves exactly as before.
+// A missing file means "no rooms": Agent Floor behaves exactly as before.
+// A broken file (half-saved, bad JSON) makes loadRooms return null, so callers keep what they have.
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { slug } from './protocol.js';
 
-const EMPTY = Object.freeze({ rooms: [], mail: {} });
+export const EMPTY = Object.freeze({ rooms: [], mail: {} });
 
 export function floorHome() {
   return process.env.AGENT_FLOOR_HOME || join(homedir(), '.agent-floor');
@@ -51,11 +52,18 @@ export function normalizeRooms(json) {
   return { rooms, mail };
 }
 
+/** EMPTY when the file does not exist, null when it exists but cannot be read or parsed. */
 export function loadRooms(file = roomsFile()) {
+  let text;
   try {
-    return normalizeRooms(JSON.parse(readFileSync(file, 'utf8')));
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    return err?.code === 'ENOENT' || err?.code === 'ENOTDIR' ? EMPTY : null;
+  }
+  try {
+    return normalizeRooms(JSON.parse(text));
   } catch {
-    return EMPTY;
+    return null;
   }
 }
 

@@ -8,7 +8,7 @@
 //   GET  /*             the built web app (dist/)
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { extname, join, normalize, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyEvent, createState, normalizeEvent, settlePinned, sweep, PROTOCOL_VERSION } from '../shared/protocol.js';
@@ -36,32 +36,54 @@ export function startServer({
   // The CLI and desktop app pass useHome: true, so tests never touch ~/.agent-floor.
   useHome = false,
   roomsFile = useHome ? defaultRoomsFile() : undefined,
-  stateFile = useHome && process.env.AGENT_FLOOR_PERSIST !== '0' ? join(floorHome(), 'state.json') : undefined,
+  // Saving only happens with a rooms file (no file = behaves as before), one file per port.
+  stateFile = useHome && process.env.AGENT_FLOOR_PERSIST !== '0' && roomsFile && existsSync(roomsFile)
+    ? join(floorHome(), `state-${port}.json`)
+    : undefined,
 } = {}) {
   const state = createState();
   const clients = new Set();
 
-  // Restore the last saved floor, so a restart or crash does not empty the rooms.
+  // Restore the roster desks (and their rooms) from the last run. Only pinned desks are
+  // saved: lead sessions carry prompts and would come back as stale ghosts.
+  const isObj = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
   if (stateFile) {
     try {
       const saved = JSON.parse(readFileSync(stateFile, 'utf8'));
-      if (saved && typeof saved.agents === 'object' && typeof saved.teams === 'object') {
-        state.teams = saved.teams;
-        state.agents = saved.agents;
+      if (isObj(saved) && isObj(saved.agents) && isObj(saved.teams)) {
+        for (const a of Object.values(saved.agents)) {
+          if (!isObj(a) || typeof a.id !== 'string' || typeof a.team !== 'string' || !a.pinned) continue;
+          state.agents[a.id] = {
+            ...a,
+            history: Array.isArray(a.history) ? a.history.filter(isObj) : [],
+            status: 'idle',
+            activity: a.idleActivity || a.activity,
+            tool: undefined,
+            parent: undefined,
+            boundKey: undefined,
+            spawns: 0,
+          };
+        }
+        const used = new Set(Object.values(state.agents).map((a) => a.team));
+        for (const [id, t] of Object.entries(saved.teams)) if (used.has(id) && isObj(t)) state.teams[id] = t;
+        for (const a of Object.values(state.agents)) if (!state.teams[a.team]) delete state.agents[a.id];
         state.seq = Number(saved.seq) || 0;
         state.updatedAt = Number(saved.updatedAt) || 0;
       }
     } catch {
-      // No saved state yet, or it is unreadable: start empty.
+      // No saved state yet, or it is unreadable: start empty (seeding fills the rooms).
     }
   }
-  let savedSeq = state.seq;
+  let savedSeq = -1;
   function save() {
     if (!stateFile || state.seq === savedSeq) return;
     try {
+      const agents = Object.fromEntries(Object.values(state.agents).filter((a) => a.pinned).map((a) => [a.id, a]));
+      const used = new Set(Object.values(agents).map((a) => a.team));
+      const teams = Object.fromEntries(Object.entries(state.teams).filter(([id]) => used.has(id)));
       mkdirSync(dirname(stateFile), { recursive: true });
       const tmp = `${stateFile}.tmp`;
-      writeFileSync(tmp, JSON.stringify(state));
+      writeFileSync(tmp, JSON.stringify({ teams, agents, seq: state.seq, updatedAt: state.updatedAt }));
       renameSync(tmp, stateFile);
       savedSeq = state.seq;
     } catch (err) {
@@ -74,7 +96,12 @@ export function startServer({
     for (const res of clients) res.write(frame);
   }
 
-  function ingest(raw) {
+  // `external` events come from POST /events: they may not pin agents (only the rooms file can).
+  function ingest(raw, { external = false } = {}) {
+    if (external && raw && typeof raw === 'object' && 'pinned' in raw) {
+      raw = { ...raw };
+      delete raw.pinned;
+    }
     const ev = normalizeEvent(raw);
     if (!ev) return false;
     const { effects } = applyEvent(state, ev);
@@ -86,7 +113,13 @@ export function startServer({
   // but are no longer listed leave the floor normally.
   function seed() {
     if (!roomsFile) return 0;
-    const events = seedEvents(loadRooms(roomsFile));
+    const cfg = loadRooms(roomsFile);
+    if (!cfg) {
+      // Half-saved or broken file: keep the desks we have until it is fixed.
+      log('Agent Floor: rooms file is unreadable, keeping the current rooms.');
+      return Object.values(state.agents).filter((a) => a.pinned).length;
+    }
+    const events = seedEvents(cfg);
     const keep = new Set(events.filter((e) => e.type === 'join').map((e) => e.agent));
     for (const a of Object.values(state.agents)) {
       if (a.pinned && !keep.has(a.id)) {
@@ -180,7 +213,7 @@ export function startServer({
         const body = await readBody(req);
         const list = Array.isArray(body) ? body : [body];
         let accepted = 0;
-        for (const raw of list.slice(0, 200)) if (ingest(raw)) accepted++;
+        for (const raw of list.slice(0, 200)) if (ingest(raw, { external: true })) accepted++;
         return json(res, accepted ? 202 : 400, { accepted, rejected: list.length - accepted });
       }
       if (pathname === '/stream' && req.method === 'GET') {

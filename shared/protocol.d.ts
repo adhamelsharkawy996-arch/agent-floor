@@ -67,6 +67,8 @@ export interface Agent {
   boundKey?: string;
   pinned?: boolean;
   idleActivity?: string;
+  /** Overlapping spawns of a pinned roster desk. */
+  spawns?: number;
 }
 
 export interface Team {
@@ -98,5 +100,5 @@ export function createState(): WorldState;
 export function slug(value: unknown): string;
 export function normalizeEvent(raw: unknown, now?: number): FloorEvent | null;
 export function applyEvent(state: WorldState, ev: FloorEvent | null): { state: WorldState; effects: Effect[] };
-export function settlePinned(state: WorldState, now?: number, opts?: { doneMs?: number }): InboundEvent[];
+export function settlePinned(state: WorldState, now?: number, opts?: { doneMs?: number; stuckMs?: number }): InboundEvent[];
 export function sweep(state: WorldState, now?: number, opts?: { offlineMs?: number; doneHelperMs?: number; staleMs?: number }): string[];
